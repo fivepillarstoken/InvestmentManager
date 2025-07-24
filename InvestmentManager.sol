@@ -34,6 +34,7 @@ contract InvestmentManager is Ownable2Step {
     error SendEtherFailed(address to);
     error InvestorAlreadyWhitelisted();
     error InvestorAlreadyNotWhitelisted();
+    error RefererCirculationDetected();
 
     /// @notice Unix timestamp when the contract starts accepting investments
     uint256 public startTimestamp;
@@ -61,6 +62,10 @@ contract InvestmentManager is Ownable2Step {
 
     /// @notice Claim fee in basis points (1 basis point = 0.0001%)
     uint256 public claimFeeInBp;
+
+    /// @notice Min swap price for send fees
+    /// @dev In 18 decimals. ETH/5PT
+    uint256 public minSwapPrice = 0;
 
     /// @notice Maximum allowed fee in basis points (10%)
     uint256 public constant MAX_FEE = 1000000;
@@ -215,6 +220,12 @@ contract InvestmentManager is Ownable2Step {
     event ClaimFeeUpdated(uint256 newClaimFeeInBp);
 
     /**
+     * @notice Emitted when the min swap price is updated by the owner
+     * @param newMinSwapPrice New min swap price
+     */
+    event MinSwapPriceUpdated(uint256 newMinSwapPrice);
+
+    /**
      * @notice Emitted when pool criteria are updated by the owner
      * @param poolIds Array of pool IDs that were updated with new criteria
      */
@@ -291,10 +302,10 @@ contract InvestmentManager is Ownable2Step {
             false, 0, 0, 0, 0, 57 * 10 ** 24, 171 * 10 ** 24, 20, 1000
         );
         pools[7] = PoolInfo(
-            false, 0, 0, 0, 0, 0, 0, 0, 1000
+            false, 0, 0, 0, 0, 0, 0, 0, 2000
         );
         pools[8] = PoolInfo(
-            false, 0, 0, 0, 0, 0, 0, 0, 1000
+            false, 0, 0, 0, 0, 0, 0, 0, 2000
         );
     }
 
@@ -355,7 +366,7 @@ contract InvestmentManager is Ownable2Step {
         } else {
             for (uint8 i = 0; i < pools.length; i++) {
                 if (!isInvestorInPool[investorAddress][i]) {
-                    break;
+                    continue;
                 }
 
                 poolsReward += pools[i].lastReward;
@@ -407,6 +418,17 @@ contract InvestmentManager is Ownable2Step {
     }
 
     /**
+     * @notice Updates the swap slippage for send fees
+     * @param newMinSwapPrice New min swap price
+     * @dev Only callable by owner
+     */
+    function setMinSwapPrice(uint256 newMinSwapPrice) external onlyOwner {
+        minSwapPrice = newMinSwapPrice;
+
+        emit MinSwapPriceUpdated(newMinSwapPrice);
+    }
+
+    /**
      * @notice Updates whitelist status in pools 8 and 9 for an investor
      * @param investor Address of the investor to update
      * @param poolId Pool ID for which the whitelist is updated
@@ -420,7 +442,10 @@ contract InvestmentManager is Ownable2Step {
         if (add) {
             if (isWhitelisted[investor][poolId]) revert InvestorAlreadyWhitelisted();
 
-            if (accountToInvestorInfo[investor].totalDeposit == 0) onlyWhitelistedInvestorsCount += 1;
+            if (
+                accountToInvestorInfo[investor].totalDeposit == 0 &&
+                !isWhitelisted[investor][poolId == 7 ? 8 : 7]
+            ) onlyWhitelistedInvestorsCount += 1;
 
             isInvestorInPool[investor][poolId] = true;
             pools[poolId].participantsCount += 1;
@@ -432,7 +457,10 @@ contract InvestmentManager is Ownable2Step {
         } else {
             if (!isWhitelisted[investor][poolId]) revert InvestorAlreadyNotWhitelisted();
 
-            if (accountToInvestorInfo[investor].totalDeposit == 0) onlyWhitelistedInvestorsCount -= 1;
+            if (
+                accountToInvestorInfo[investor].totalDeposit == 0 &&
+                !isWhitelisted[investor][poolId == 7 ? 8 : 7]
+            ) onlyWhitelistedInvestorsCount -= 1;
 
             _updateInvestorPoolRewards(investor);
 
@@ -462,12 +490,7 @@ contract InvestmentManager is Ownable2Step {
         uint8[] calldata poolIds,
         PoolCriteria[] calldata criteriaOfPools,
         uint256 checkCountLimit
-    ) external onlyOwner {
-        // The amount of gas spent for all operations below
-        uint256 gasSpent = 0;
-        // Only 2/3 of block gas limit could be spent.
-        uint256 lastGasLeft = gasleft();
-        
+    ) external onlyOwner {        
         if (!isUpdateCriteriaActive) {
             if (block.timestamp - lastUpdatePoolCriteriaTimestamp < poolCriteriaUpdateDelay) revert SetPoolCriteriaNotYetAvailable();
             if (poolIds.length != criteriaOfPools.length) revert InvalidArrayLengths();
@@ -517,19 +540,17 @@ contract InvestmentManager is Ownable2Step {
                     isInvestorInPool[investorAddress][storedPoolIds[j]] = false;
                     pools[storedPoolIds[j]].participantsCount -= 1;
                 } else if (!isInPool && isShouldBeInPool) {
+                    if (poolInfo.participantsCount == 0) {
+                        pools[storedPoolIds[j]].isActive = true;
+                    }
                     isInvestorInPool[investorAddress][storedPoolIds[j]] = true;
                     pools[storedPoolIds[j]].participantsCount += 1;
                     accountToInvestorInfo[investorAddress].poolRewardPerInvestorPaid[storedPoolIds[j]] = poolInfo.rewardPerInvestorStored;
                 }
             }
             checkCount += 1;
-            lastGasLeft = gasleft();
-            // Increase the total amount of gas spent
-            gasSpent += lastGasLeft - gasleft();
-            // Check that no more than 2/3 of block gas limit was spent
-            if (gasSpent >= (block.gaslimit * 2) / 3 || checkCount >= checkCountLimit) {
-                _updateCriteriaCurInvestorId = i;
-                // emit GasLimitReached(gasSpent, block.gaslimit);
+            if (checkCount >= checkCountLimit) {
+                _updateCriteriaCurInvestorId = i + 1;
                 // No revert here. Part of changes will take place
                 return;
             }
@@ -572,6 +593,7 @@ contract InvestmentManager is Ownable2Step {
         if (isFirstDeposit) {
             _checkDepositOrClaimAmount(amount);
             investor.referer = referer;
+            _checkRefererCirculation(referer);
             _investors.push(investorAddress);
             if (isWhitelisted[investorAddress][7] || isWhitelisted[investorAddress][8]) onlyWhitelistedInvestorsCount -= 1;
         }
@@ -615,6 +637,10 @@ contract InvestmentManager is Ownable2Step {
         fivePillarsToken.mint(investorAddress, toInvestor);
 
         // Redistribute half user reward
+        if (investor.totalDeposit == 0) {
+            _investors.push(investorAddress);
+            if (isWhitelisted[investorAddress][7] || isWhitelisted[investorAddress][8]) onlyWhitelistedInvestorsCount -= 1;
+        }
         if (investor.referer != address(0)) _updateReferers(investor.referer, toRedistribute, false);
         _updatePoolRewards(toRedistribute, investorAddress, investor.referer);
         accountToInvestorInfo[investorAddress].totalDeposit += toRedistribute;
@@ -635,9 +661,20 @@ contract InvestmentManager is Ownable2Step {
         if (oldValue / 2 < (oldValue > newValue ? oldValue - newValue : newValue - oldValue)) revert HalfRequirementViolated();
     }
 
+    function _checkRefererCirculation(address referer) internal view {
+        address directReferer = referer;
+        if (referer != address(0)) {
+            for (uint i = 0; i < 9; i++) {
+                referer = accountToInvestorInfo[referer].referer;
+                if (referer == address(0)) break;
+                if (referer == directReferer) revert RefererCirculationDetected();
+            }
+        }
+    }
+
     function _calcCountOfRoundsSinceLastUpdate(uint32 lastUpdate) internal view returns(uint256) {
         uint256 startTime = startTimestamp;
-        if (lastUpdate <= startTime) return 0;
+        if (lastUpdate < startTime || block.timestamp < startTime) return 0;
         return (block.timestamp - startTime) / roundDuration - (lastUpdate - startTime) / roundDuration;
     }
 
@@ -842,6 +879,7 @@ contract InvestmentManager is Ownable2Step {
 
     function _trySendFees() internal {
         uint256 accumulatedFees = fivePillarsToken.balanceOf(address(this));
+        uint256 amountOutMin = accumulatedFees * minSwapPrice / 10 ** 18;
         if(accumulatedFees > 0) {
             fivePillarsToken.approve(dexRouter, accumulatedFees);
             address[] memory path = new address[](2);
@@ -850,7 +888,7 @@ contract InvestmentManager is Ownable2Step {
             (bool success, ) = dexRouter.call(abi.encodeWithSelector(
                 IPancakeRouter01.swapExactTokensForETH.selector,
                 accumulatedFees,
-                1,
+                amountOutMin,
                 path,
                 address(this),
                 block.timestamp
