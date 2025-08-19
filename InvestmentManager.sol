@@ -574,12 +574,11 @@ contract InvestmentManager is Ownable2Step {
             if (investor.referer != address(0)) revert RefererAlreadySetted();
             if (investorAddress == referer) revert InvalidReferer();
             investor.referer = referer;
+            _checkRefererCirculation(referer);
         }
         bool isFirstDeposit = investor.totalDeposit == 0;
         if (isFirstDeposit) {
             _checkDepositOrClaimAmount(amount);
-            investor.referer = referer;
-            _checkRefererCirculation(referer);
             _investors.push(investorAddress);
             if (isWhitelisted[investorAddress][7] || isWhitelisted[investorAddress][8]) onlyWhitelistedInvestorsCount -= 1;
         }
