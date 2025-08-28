@@ -36,6 +36,7 @@ contract InvestmentManager is Ownable2Step {
     error InvestorAlreadyNotWhitelisted();
     error RefererCirculationDetected();
     error NoFeesToSwap();
+    error NoDeposit();
 
     /// @notice Unix timestamp when the contract starts accepting investments
     uint256 public startTimestamp;
@@ -570,13 +571,13 @@ contract InvestmentManager is Ownable2Step {
         fivePillarsToken.transferFrom(investorAddress, address(this), fee);
         fivePillarsToken.burnFrom(investorAddress, toInvestor);
 
+        bool isFirstDeposit = investor.totalDeposit == 0;
         if (referer != address(0)) {
-            if (investor.referer != address(0)) revert RefererAlreadySetted();
+            if (!isFirstDeposit) revert RefererAlreadySetted();
             if (investorAddress == referer) revert InvalidReferer();
             investor.referer = referer;
             _checkRefererCirculation(referer);
         }
-        bool isFirstDeposit = investor.totalDeposit == 0;
         if (isFirstDeposit) {
             _checkDepositOrClaimAmount(amount);
             _investors.push(investorAddress);
@@ -608,6 +609,7 @@ contract InvestmentManager is Ownable2Step {
         address investorAddress = _msgSender();
         _updateInvestorRewards(investorAddress);
         InvestorInfo memory investor = accountToInvestorInfo[investorAddress];
+        if (investor.totalDeposit == 0) revert NoDeposit();
         _checkDepositOrClaimAmount(investor.accumulatedReward);
 
         accountToInvestorInfo[investorAddress].accumulatedReward = 0;
@@ -620,10 +622,6 @@ contract InvestmentManager is Ownable2Step {
         fivePillarsToken.mint(investorAddress, toInvestor);
 
         // Redistribute half user reward
-        if (investor.totalDeposit == 0) {
-            _investors.push(investorAddress);
-            if (isWhitelisted[investorAddress][7] || isWhitelisted[investorAddress][8]) onlyWhitelistedInvestorsCount -= 1;
-        }
         if (investor.referer != address(0)) _updateReferers(investor.referer, toRedistribute, false);
         _updatePoolRewards(toRedistribute, investorAddress, investor.referer);
         accountToInvestorInfo[investorAddress].totalDeposit += toRedistribute;
