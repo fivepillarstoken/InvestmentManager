@@ -35,6 +35,7 @@ contract InvestmentManager is Ownable2Step {
     error InvestorAlreadyWhitelisted();
     error InvestorAlreadyNotWhitelisted();
     error RefererCirculationDetected();
+    error NoFeesToSwap();
 
     /// @notice Unix timestamp when the contract starts accepting investments
     uint256 public startTimestamp;
@@ -45,8 +46,8 @@ contract InvestmentManager is Ownable2Step {
     /// @notice Minimum time between deposits for an investor in seconds (4 hours)
     uint256 public constant depositDelay = 60 * 60 * 4;
 
-    /// @notice Minimum time between pool criteria updates in seconds (30 hours)
-    uint256 public constant poolCriteriaUpdateDelay = 60 * 60 * 30;
+    /// @notice Minimum time between pool criteria updates in seconds (30 days)
+    uint256 public constant poolCriteriaUpdateDelay = 60 * 60 * 24 * 30;
 
     /// @notice Timestamp of the last pool criteria update
     uint256 public lastUpdatePoolCriteriaTimestamp;
@@ -62,10 +63,6 @@ contract InvestmentManager is Ownable2Step {
 
     /// @notice Claim fee in basis points (1 basis point = 0.0001%)
     uint256 public claimFeeInBp;
-
-    /// @notice Min swap price for send fees
-    /// @dev In 18 decimals. ETH/5PT
-    uint256 public minSwapPrice = 0;
 
     /// @notice Maximum allowed fee in basis points (10%)
     uint256 public constant MAX_FEE = 1000000;
@@ -220,22 +217,10 @@ contract InvestmentManager is Ownable2Step {
     event ClaimFeeUpdated(uint256 newClaimFeeInBp);
 
     /**
-     * @notice Emitted when the min swap price is updated by the owner
-     * @param newMinSwapPrice New min swap price
-     */
-    event MinSwapPriceUpdated(uint256 newMinSwapPrice);
-
-    /**
      * @notice Emitted when pool criteria are updated by the owner
      * @param poolIds Array of pool IDs that were updated with new criteria
      */
     event PoolsCriteriaUpdated(uint8[] poolIds);
-
-    /**
-     * @notice Emitted when the automatic fee swap to ETH fails
-     * @param accumulatedFees Amount of tokens that failed to be swapped
-     */
-    event SwapFeesFailed(uint256 accumulatedFees);
 
     /**
      * @notice Emitted when an investor's whitelist status is updated
@@ -244,6 +229,18 @@ contract InvestmentManager is Ownable2Step {
      * @param add True if being added to whitelist, false if being removed
      */
     event WhitelistUpdated(address account, uint256 poolId, bool add);
+
+    /**
+     * @notice Emitted when fees are swapped and sent to treasuries
+     * @param accumulatedFees Total fees swapped
+     * @param firstTreasuryAmount Amount sent to the primary treasury
+     * @param secondTreasuryAmount Amount sent to the secondary treasury
+     */
+    event SwapAndSendFees(
+        uint256 accumulatedFees,
+        uint256 firstTreasuryAmount,
+        uint256 secondTreasuryAmount
+    );
 
     /**
      * @notice Initializes the InvestmentManager contract with required parameters
@@ -418,17 +415,6 @@ contract InvestmentManager is Ownable2Step {
     }
 
     /**
-     * @notice Updates the swap slippage for send fees
-     * @param newMinSwapPrice New min swap price
-     * @dev Only callable by owner
-     */
-    function setMinSwapPrice(uint256 newMinSwapPrice) external onlyOwner {
-        minSwapPrice = newMinSwapPrice;
-
-        emit MinSwapPriceUpdated(newMinSwapPrice);
-    }
-
-    /**
      * @notice Updates whitelist status in pools 8 and 9 for an investor
      * @param investor Address of the investor to update
      * @param poolId Pool ID for which the whitelist is updated
@@ -588,11 +574,12 @@ contract InvestmentManager is Ownable2Step {
             if (investor.totalDeposit > 0) revert RefererAlreadySetted();
             if (investorAddress == referer) revert InvalidReferer();
             investor.referer = referer;
-            _checkRefererCirculation(referer);
         }
         bool isFirstDeposit = investor.totalDeposit == 0;
         if (isFirstDeposit) {
             _checkDepositOrClaimAmount(amount);
+            investor.referer = referer;
+            _checkRefererCirculation(referer);
             _investors.push(investorAddress);
             if (isWhitelisted[investorAddress][7] || isWhitelisted[investorAddress][8]) onlyWhitelistedInvestorsCount -= 1;
         }
@@ -609,8 +596,6 @@ contract InvestmentManager is Ownable2Step {
         totalDepositAmount += toInvestor;
 
         emit Deposit(investorAddress, investor.referer, toInvestor);
-
-        _trySendFees();
     }
 
     /**
@@ -648,8 +633,17 @@ contract InvestmentManager is Ownable2Step {
         emit Redistribute(investorAddress, toRedistribute);
 
         emit ClaimReward(investorAddress, toInvestor);
+    }
 
-        _trySendFees();
+    /**
+     * @notice Swaps accumulated fees for ETH and sends them to the treasury
+     * @param minSwapPrice Minimum swap price for send fees in 18 decimals (ETH/5PT)
+     * @dev Only callable by owner
+     * @dev Swaps all accumulated fees and sends to treasury
+     * @dev Set `minSwapPrice` to 0 to disable price check
+     */
+    function swapAndSendFees(uint256 minSwapPrice) external onlyOwner {
+        _swapAndSendFees(minSwapPrice);
     }
 
     function _checkDepositOrClaimAmount(uint256 amount) internal pure {
@@ -876,7 +870,7 @@ contract InvestmentManager is Ownable2Step {
         return false;
     }
 
-    function _trySendFees() internal {
+    function _swapAndSendFees(uint256 minSwapPrice) internal {
         uint256 accumulatedFees = fivePillarsToken.balanceOf(address(this));
         uint256 amountOutMin = accumulatedFees * minSwapPrice / 10 ** 18;
         if(accumulatedFees > 0) {
@@ -884,26 +878,29 @@ contract InvestmentManager is Ownable2Step {
             address[] memory path = new address[](2);
             path[0] = address(fivePillarsToken);
             path[1] = IPancakeRouter01(dexRouter).WETH();
-            (bool success, ) = dexRouter.call(abi.encodeWithSelector(
-                IPancakeRouter01.swapExactTokensForETH.selector,
+            IPancakeRouter01(dexRouter).swapExactTokensForETH(
                 accumulatedFees,
                 amountOutMin,
                 path,
                 address(this),
                 block.timestamp
-            ));
-            if (!success) {
-                fivePillarsToken.approve(dexRouter, 0);
-                emit SwapFeesFailed(accumulatedFees);
-                return;
-            }
+            );
 
-            uint256 firstTreasuryAmount = address(this).balance * 70 / 100;
-            (success,) = payable(treasury).call{value: firstTreasuryAmount}("");
+            uint256 balance = address(this).balance;
+            uint256 firstTreasuryAmount = balance * 70 / 100;
+            (bool success,) = payable(treasury).call{value: firstTreasuryAmount}("");
             if (!success) revert SendEtherFailed(treasury);
 
-            (success,) = payable(treasury2).call{value: address(this).balance}("");
+            (success,) = payable(treasury2).call{value: balance - firstTreasuryAmount}("");
             if (!success) revert SendEtherFailed(treasury2);
+
+            emit SwapAndSendFees(
+                accumulatedFees,
+                firstTreasuryAmount,
+                balance - firstTreasuryAmount
+            );
+        } else {
+            revert NoFeesToSwap();
         }
     } 
 }
